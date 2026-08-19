@@ -24,15 +24,22 @@ async def scrape_league(page: Page, league: League, attempts: int = 2):
     for attempt in range(1, attempts + 1):
         try:
             response = await page.goto(league.url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS)
-            status = response.status if response else None
-            if status and status >= 400:
-                raise RuntimeError(f"HTTP {status} em {league.url}")
-            await page.wait_for_timeout(900 + random.randint(0, 500))
+            initial_status = response.status if response else None
+
+            # Alguns sites respondem 403 inicialmente e liberam o conteúdo após
+            # scripts/cookies do navegador. Não abortamos imediatamente: esperamos
+            # alguns segundos e tentamos ler o DOM final.
+            await page.wait_for_timeout(3500 + random.randint(0, 1200))
             html = await page.content()
             matches = parse_matches(html, league)
-            if not matches:
-                raise RuntimeError("Página abriu, mas nenhum resultado de partida foi reconhecido.")
-            return matches
+            if matches:
+                return matches
+
+            status_text = f"HTTP inicial {initial_status}; " if initial_status else ""
+            title = await page.title()
+            raise RuntimeError(
+                f"{status_text}nenhum resultado reconhecido. Título final: {title[:120]!r}"
+            )
         except Exception as exc:
             last_exc = exc
             ARTIFACTS.mkdir(exist_ok=True)
@@ -58,13 +65,28 @@ async def _run_one(context: BrowserContext, league: League):
 async def scrape_all():
     results = {}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--disable-dev-shm-usage", "--no-sandbox"])
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         context = await browser.new_context(
             locale="pt-BR",
             timezone_id="America/Sao_Paulo",
             viewport={"width": 1440, "height": 1200},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+            extra_http_headers={
+                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+
         tasks = {league.code: asyncio.create_task(_run_one(context, league)) for league in LEAGUES}
         for code, task in tasks.items():
             try:
